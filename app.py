@@ -16,17 +16,16 @@ from dotenv import load_dotenv
 # โหลด .env
 load_dotenv()
 
-# เพิ่ม root project ใน sys.path เพื่อ import Ocr.py
-ROOT_DIR = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT_DIR))
-
-FRONTEND_DIR = ROOT_DIR / "frontend"
-
-from Ocr import SlipOCR, SlipParser  # noqa: E402
+from Ocr import SlipOCR, SlipParser
 
 # ── Config ──────────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("ocr_service")
+log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, log_level, logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+logger = logging.getLogger("slipscan.ocr")
 
 UPLOAD_DIR   = Path(__file__).parent / "temp_uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
@@ -35,7 +34,20 @@ MAX_SIZE_MB  = int(os.getenv("OCR_MAX_FILE_SIZE_MB", 10))
 ALLOWED_EXT  = {".jpg", ".jpeg", ".png", ".webp"}
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = MAX_SIZE_MB * 1024 * 1024  # bytes
+app.config["MAX_CONTENT_LENGTH"] = MAX_SIZE_MB * 1024 * 1024
+
+from flask import g
+import time as _time
+
+@app.before_request
+def _before():
+    g.start_time = _time.time()
+
+@app.after_request
+def _after(response):
+    duration_ms = round((_time.time() - g.get("start_time", _time.time())) * 1000)
+    logger.info("%s %s → %d (%dms)", request.method, request.path, response.status_code, duration_ms)
+    return response
 
 # Initialise OCR (สร้างครั้งเดียว)
 ocr_engine = SlipOCR(
@@ -45,18 +57,6 @@ ocr_engine = SlipOCR(
 )
 slip_parser = SlipParser()
 
-
-# ── Serve Frontend ────────────────────────────────────────────────────────────
-@app.get("/")
-def index():
-    """เปิด IP → redirect ไปหน้า login ทันที"""
-    return redirect("/login.html")
-
-
-@app.get("/<path:filename>")
-def serve_frontend(filename):
-    """Serve static HTML/CSS/JS จาก frontend/ folder"""
-    return send_from_directory(str(FRONTEND_DIR), filename)
 
 
 # ── Health Check ──────────────────────────────────────────────────────────────
@@ -181,5 +181,5 @@ def not_found(e):
 # ── Run ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.getenv("OCR_SERVICE_PORT", 5000))
-    logger.info(f"🚀 OCR Service starting on http://localhost:{port}")
-    app.run(host="0.0.0.0", port=port, debug=True)
+    logger.info("SlipScan OCR Service starting on http://0.0.0.0:%d", port)
+    app.run(host="0.0.0.0", port=port, debug=False)
