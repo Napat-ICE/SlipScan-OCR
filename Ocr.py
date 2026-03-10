@@ -305,32 +305,62 @@ class SlipParser:
     def _extract_sender_name(self, text: str) -> str | None:
         # กรอง noise ออก (คำอธิบายรูป, การ์ตูน, etc.)
         text_clean = text
-        
+
         # ลบ figure tags และเนื้อหาข้างใน
         text_clean = re.sub(r'<figure>.*?</figure>', '', text_clean, flags=re.DOTALL)
-        
+
         # ลบคำที่เป็น noise
         noise_words = ['one piece', 'ocean of fire', 'ยืนอยู่ทาง', 'ภาพประกอบ', 'qr code', 'เหรียญทอง', 'ตัวละคร']
         for noise in noise_words:
             text_clean = re.sub(noise, '', text_clean, flags=re.IGNORECASE)
-        
-        # ตัวอย่างเบื้องต้น: หาชื่อที่อยู่หลังคำว่า "จาก" หรือ "from" หรือชื่อบุคคลไทย
-        patterns = [
+
+        # ── Pattern 1: มีคำนำหน้าชัดเจน (ผู้โอน, จาก, from, sender) ──────────
+        keyword_patterns = [
             r'(?:จาก|from|ผู้โอน|sender)[\*:\s\n]+((?:นาย|นาง|นางสาว|Mr\.|Mrs\.|Ms\.)?\s*[\u0E00-\u0E7Fa-zA-Z]+\s+[\u0E00-\u0E7Fa-zA-Z]+)',
             r'(?:จาก|from|ผู้โอน|sender)[\*:\s\n]+([^\n]+)'
         ]
-        
-        for pattern in patterns:
+
+        for pattern in keyword_patterns:
             match = re.search(pattern, text_clean, re.IGNORECASE | re.MULTILINE)
             if match:
-                name = match.group(1).strip()
-                # ทำความสะอาด: ลบ newlines และช่องว่างซ้ำ
-                name = ' '.join(name.split())
-                # ตรวจสอบว่าชื่อไม่ใช่ noise
+                name = ' '.join(match.group(1).split())
                 if len(name) < 100 and not any(n in name.lower() for n in noise_words):
                     return name
-        
+
+        # ── Pattern 2: K+ / KBank format ──────────────────────────────────────
+        # รูปแบบ: "ชำระเงินสำเร็จ K+" → วันที่ → "นาย ณฎัตร ช." → "ธ.กสิกรไทย xxx..."
+        # ชื่อผู้โอนจะอยู่บรรทัดถัดจากวันที่/เวลา และอยู่เหนือบรรทัดที่มีชื่อธนาคาร
+        kplus_match = re.search(
+            r'\d{1,2}\s*(?:ม\.ค\.|ก\.พ\.|มี\.ค\.|เม\.ย\.|พ\.ค\.|มิ\.ย\.|ก\.ค\.|ส\.ค\.|ก\.ย\.|ต\.ค\.|พ\.ย\.|ธ\.ค\.)[^\n]*\n+'  # บรรทัดวันที่
+            r'((?:นาย|นาง|นางสาว|Mr\.|Mrs\.|Ms\.)[^\n]+)',  # ชื่อ — หยุดที่ end of line
+            text_clean, re.IGNORECASE
+        )
+        if kplus_match:
+            name = ' '.join(kplus_match.group(1).split())
+            if 3 <= len(name) < 100:
+                return name
+
+        # ── Pattern 3: ชื่อไทยที่มีคำนำหน้า ในบรรทัดใดก็ได้ ──────────────────
+        # Fallback สุดท้าย: หา "นาย/นาง/นางสาว + ชื่อ นามสกุล" อยู่ในบรรทัดเดียว
+        # แต่ต้องไม่ใช่บรรทัด receiver (มักอยู่หลัง "ถึง" หรือ "MOMOYO")
+        lines = text_clean.split('\n')
+        receiver_hint_found = False
+        for line in lines:
+            line = line.strip()
+            if re.search(r'(?:ถึง|to|ผู้รับ|receiver|MOMOYO|KANGSADAN)', line, re.IGNORECASE):
+                receiver_hint_found = True
+            if not receiver_hint_found:
+                title_match = re.match(
+                    r'^((?:นาย|นาง|นางสาว)\s*[\u0E00-\u0E7Fa-zA-Z]+(?:\s+[\u0E00-\u0E7Fa-zA-Z\.]+){1,3})$',
+                    line
+                )
+                if title_match:
+                    name = ' '.join(title_match.group(1).split())
+                    if 5 <= len(name) < 80:
+                        return name
+
         return None
+
 
     def _extract_receiver_name(self, text: str) -> str | None:
         # กรอง figure tags
