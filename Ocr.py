@@ -284,19 +284,27 @@ class SlipParser:
             
         # ลบช่องว่างหรือเครื่องหมายแปลกปลอมที่อาจติดมา
         cleaned = re.sub(r'[^A-Za-z0-9]', '', ref_no)
-        
+
+        # ── 0. แก้ปัญหา OCR อ่าน 0 เป็น O/o (พบบ่อยมากใน ref ที่เป็น hex) ──
+        # ตรวจว่า ref ดูเหมือน hex string หรือไม่ (มีเฉพาะ 0-9, a-f, A-F)
+        # ถ้าเป็น hex ให้แปลง O/o ทั้งหมดเป็น 0
+        if re.match(r'^[0-9A-Fa-fOo]+$', cleaned):
+            cleaned = cleaned.replace('O', '0').replace('o', '0')
+        else:
+            # ถ้าไม่ใช่ hex ให้ทำ context-aware: ถ้า o/O อยู่ระหว่างตัวเลข → เป็น 0
+            def fix_o_in_digits(m):
+                return m.group(0).replace('O', '0').replace('o', '0')
+            cleaned = re.sub(r'\d[Oo]+\d', fix_o_in_digits, cleaned)
+            # ถ้า ref ขึ้นต้นด้วยตัวอักษร 1 ตัว แล้วตามด้วย O/o + ตัวเลข → O/o เป็น 0
+            cleaned = re.sub(r'^([A-Za-z])[Oo](\d)', r'\g<1>0\2', cleaned)
+
         # 1. แก้ปัญหา 1 เป็น I สำหรับออมสิน (GSB - MyMo)
-        # รหัสอ้างอิง MyMo มักมีความยาว 24 หลัก และมีตัว I แทรกอยู่ตรงกลางเสมอ (ที่เจอคือ 52332202350[91]000025B9790 -> 523322023509I000025B9790)
-        # เราจะใช้ Regex ช่วยกรอง ว่ามันเป็นตัวเลขยาวๆ 12 หลัก แล้วมีตัว 1 ตามด้วยอักขระอื่นๆ ให้ครบ 24
-        # เพื่อหลีกเลี่ยงผลกระทบต่อธนาคารที่ไม่ได้ใช้ format นี้
         mymo_pattern = re.compile(r'^(\d{12})1([A-Za-z0-9]{11})$')
         match = mymo_pattern.search(cleaned)
         if match and len(cleaned) == 24:
              cleaned = match.group(1) + 'I' + match.group(2)
 
         # 2. แก้ปัญหาธนาคารกรุงศรี (Krungsri: BAY) (มักมี KS นำหน้า)
-        # ถ้าเริ่มด้วย KS แล้วความยาวขาดไป 1 ตัว (มักจะเป็น 00 หายไป 1 ตัว)
-        # เช่น KS000000328025205 (17 หลัก) -> KS0000000328025205 (18 หลัก)
         if cleaned.startswith('KS') and len(cleaned) == 17:
              cleaned = cleaned.replace('KS', 'KS0')
              
