@@ -149,8 +149,8 @@ class SlipParser:
     )
     
     REF_REGEX = re.compile(
-        r'(?:รหัส|เลขที่รายการ|ref|อ้างอิง|หมายเลข|reference|เลขที่)[*.\s:]*([A-Z0-9a-z-]{6,40})\*?',
-        re.IGNORECASE
+        r'(?:รหัส|รหัสอ้างอิง|เลขที่รายการ|ref|อ้างอิง|หมายเลข|reference|เลขที่)[*.\s:]*([A-Z0-9a-z\-]{6,40})\*?',
+        re.IGNORECASE | re.MULTILINE
     )
     
     # บัญชีธนาคารทั่วไป (xxx-x-xxxxx-x)
@@ -167,15 +167,16 @@ class SlipParser:
     def parse(self, raw_text: str) -> dict[str, Any]:
 
         text = raw_text.lower()
+        bank_name = self._extract_bank_name(text)
 
         return {
             "sender_name": self._extract_sender_name(raw_text),
             "sender_account": self._extract_sender_account(raw_text),
-            "bank_name": self._extract_bank_name(text),
+            "bank_name": bank_name,
             "amount": self._extract_amount(text),
             "slip_date": self._extract_date(text),
             "slip_time": self._extract_time(text),
-            "ref_no": self._extract_ref_no(raw_text),
+            "ref_no": self._extract_ref_no(raw_text, bank_name),
             "receiver_name": self._extract_receiver_name(raw_text),
             "receiver_account": self._extract_receiver_account(raw_text),
             "raw_ocr": raw_text,
@@ -210,6 +211,25 @@ class SlipParser:
         return None
 
     def _extract_bank_name(self, text: str) -> str | None:
+        """ดึงชื่อธนาคารของผู้โอน (sender) จากข้อความ OCR"""
+        
+        # ── Priority 1: ตรวจ MyMo เฉพาะ (mymo = ออมสิน) ──
+        if re.search(r'mymo', text, re.IGNORECASE):
+            return 'ออมสิน'
+        
+        # ── Priority 2: หาธนาคารที่อยู่ใกล้คำว่า "จาก/from/ผู้โอน" ──
+        sender_section = ''
+        sender_match = re.search(
+            r'(?:จาก|from|ผู้โอน|sender)[\s\n:]*(.{5,80})',
+            text, re.IGNORECASE | re.DOTALL
+        )
+        if sender_match:
+            sender_section = sender_match.group(1).lower()
+            for bank, pattern in self.BANK_PATTERNS.items():
+                if re.search(pattern, sender_section, re.IGNORECASE):
+                    return bank
+        
+        # ── Priority 3: Fallback — หาธนาคารแรกที่เจอในข้อความทั้งหมด ──
         for bank, pattern in self.BANK_PATTERNS.items():
             if re.search(pattern, text, re.IGNORECASE):
                 return bank
@@ -271,42 +291,42 @@ class SlipParser:
             return f"{int(hour):02d}:{int(minute):02d}:{int(second):02d}"
         return None
 
-    def _extract_ref_no(self, text: str) -> str | None:
-        match = self.REF_REGEX.search(text)
-        if match:
-            return self._clean_ref_no(match.group(1))
+    def _extract_ref_no(self, text: str, bank_name: str | None = None) -> str | None:
+        matches = self.REF_REGEX.findall(text)
+        if matches:
+            # เลือก Ref No ที่ยาวที่สุดเพื่อป้องกันการดึงผิดในสลิปกรุงศรี (เช่น หมายเลขอ้างอิง 1 vs หมายเลขอ้างอิงหลัก)
+            longest_match = max(matches, key=len)
+            return self._clean_ref_no(longest_match, bank_name)
         return None
 
-    def _clean_ref_no(self, ref_no: str) -> str:
-        """ทำความสะอาดและแก้ไข Ref No. ที่มักจะอ่านผิดพลาดจาก OCR"""
+    def _clean_ref_no(self, ref_no: str, bank_name: str | None = None) -> str:
+        """ทำความสะอาดและแก้ไข Ref No. ที่มักจะอ่านผิดพลาดจาก OCR โดยใช้ธนาคารเป็นบริบท"""
         if not ref_no:
             return ref_no
             
         # ลบช่องว่างหรือเครื่องหมายแปลกปลอมที่อาจติดมา
         cleaned = re.sub(r'[^A-Za-z0-9]', '', ref_no)
 
+        if bank_name == 'ออมสิน':
+            # 1. แก้ปัญหา OCR ดรอปตัว I ของ MyMo (Ref: 12 digits + I + 11 chars)
+            mymo_pattern_insert = re.compile(r'^(\d{12})([0-9a-zA-Z]{11})$')
+            match = mymo_pattern_insert.search(cleaned)
+            if match:
+                cleaned = match.group(1) + 'I' + match.group(2)
+        elif bank_name == 'กรุงศรี':
+            # 2. แก้ปัญหาธนาคารกรุงศรี (Krungsri: BAY) (มักมี KS นำหน้า)
+            if cleaned.startswith('KS') and len(cleaned) == 17:
+                 cleaned = cleaned.replace('KS', 'KS0')
+
         # ── 0. แก้ปัญหา OCR อ่าน 0 เป็น O/o (พบบ่อยมากใน ref ที่เป็น hex) ──
         # ตรวจว่า ref ดูเหมือน hex string หรือไม่ (มีเฉพาะ 0-9, a-f, A-F)
-        # ถ้าเป็น hex ให้แปลง O/o ทั้งหมดเป็น 0
         if re.match(r'^[0-9A-Fa-fOo]+$', cleaned):
             cleaned = cleaned.replace('O', '0').replace('o', '0')
         else:
-            # ถ้าไม่ใช่ hex ให้ทำ context-aware: ถ้า o/O อยู่ระหว่างตัวเลข → เป็น 0
             def fix_o_in_digits(m):
                 return m.group(0).replace('O', '0').replace('o', '0')
             cleaned = re.sub(r'\d[Oo]+\d', fix_o_in_digits, cleaned)
-            # ถ้า ref ขึ้นต้นด้วยตัวอักษร 1 ตัว แล้วตามด้วย O/o + ตัวเลข → O/o เป็น 0
             cleaned = re.sub(r'^([A-Za-z])[Oo](\d)', r'\g<1>0\2', cleaned)
-
-        # 1. แก้ปัญหา 1 เป็น I สำหรับออมสิน (GSB - MyMo)
-        mymo_pattern = re.compile(r'^(\d{12})1([A-Za-z0-9]{11})$')
-        match = mymo_pattern.search(cleaned)
-        if match and len(cleaned) == 24:
-             cleaned = match.group(1) + 'I' + match.group(2)
-
-        # 2. แก้ปัญหาธนาคารกรุงศรี (Krungsri: BAY) (มักมี KS นำหน้า)
-        if cleaned.startswith('KS') and len(cleaned) == 17:
-             cleaned = cleaned.replace('KS', 'KS0')
              
         return cleaned
 
@@ -332,7 +352,8 @@ class SlipParser:
             match = re.search(pattern, text_clean, re.IGNORECASE | re.MULTILINE)
             if match:
                 name = ' '.join(match.group(1).split())
-                if len(name) < 100 and not any(n in name.lower() for n in noise_words):
+                # ป้องกันการดึงชื่อธนาคารมาเป็นชื่อผู้โอน
+                if len(name) < 100 and not any(n in name.lower() for n in noise_words) and not name.replace(' ', '').startswith('ธนาคาร'):
                     return name
 
         # ── Pattern 2: K+ / KBank format ──────────────────────────────────────
@@ -359,13 +380,35 @@ class SlipParser:
                 receiver_hint_found = True
             if not receiver_hint_found:
                 title_match = re.match(
-                    r'^((?:นาย|นาง|นางสาว)\s*[\u0E00-\u0E7Fa-zA-Z]+(?:\s+[\u0E00-\u0E7Fa-zA-Z\.]+){1,3})$',
+                    r'^((?:นาย|นาง|นางสาว)\s*[\u0E00-\u0E7Fa-zA-Z\*]+(?:\s+[\u0E00-\u0E7Fa-zA-Z\*\.]+){1,3})$',
                     line
                 )
                 if title_match:
                     name = ' '.join(title_match.group(1).split())
                     if 5 <= len(name) < 80:
                         return name
+
+        # ── Pattern 4: Krungthai — ชื่ออยู่บรรทัดถัดจาก icon/section ────────────
+        # กรุงไทย format: "นาย วรพันธุ์ ค***" อยู่ในบรรทัดเดียวกับ bank info
+        for line in lines:
+            line = line.strip()
+            m = re.match(
+                r'^((?:นาย|นาง|นางสาว|น\.ส\.)\s*[\u0E00-\u0E7Fa-zA-Z\*]+(?:\s+[\u0E00-\u0E7Fa-zA-Z\*\.]+){0,3})',
+                line
+            )
+            if m:
+                name = ' '.join(m.group(1).split())
+                if 3 <= len(name) < 80:
+                    return name
+
+        # ── Pattern 5: Krungsri — ชื่อขึ้นต้นด้วยภาษาอังกฤษตัวพิมพ์ใหญ่ (มักอยู่เหนือบัญชี) ────────────
+        # Format: RACHAPOL SAKU\nXXX-1-22085-X
+        lines_list = text_clean.split('\n')
+        for i, line in enumerate(lines_list):
+            if re.match(r'^[A-Z][A-Z\s\.]+$', line.strip()) and len(line.strip()) > 3:
+                # ถ้าบรรทัดถัดไปเป็นหมายเลขบัญชีแบบ XXX- หรือมี X
+                if i + 1 < len(lines_list) and re.search(r'x', lines_list[i+1], re.IGNORECASE):
+                    return line.strip()
 
         return None
 
@@ -375,7 +418,7 @@ class SlipParser:
         text_clean = re.sub(r'<figure>.*?</figure>', '', text, flags=re.DOTALL)
         
         patterns = [
-            r'(?:ถึง|to|ผู้รับ|receiver)[*:\s]+([^\n]+)',
+            r'(?:ถึง|to|ผู้รับ|receiver|ไปยัง)[*:\s]+([^\n]+)',
             r'(?:บริษัท|ห้าง|ร้าน)\s+([\u0E00-\u0E7Fa-zA-Z\s&\-\.]+)',
             # สำหรับ K+ format: ชื่อร้านอยู่บรรทัดถัดจาก logo/brand
             r'(?:Tops|7-Eleven|Lotus|Big C|Central|Family Mart|Lawson|Makro)\s*(?:daily)?\n?([\u0E00-\u0E7Fa-zA-Z\s&\-\.]+)',
@@ -385,12 +428,36 @@ class SlipParser:
             match = re.search(pattern, text_clean, re.IGNORECASE)
             if match:
                 name = match.group(1).strip()
-                # ทำความสะอาด: ลบ newlines และช่องว่างซ้ำ
                 name = ' '.join(name.split())
-                # กรองชื่อที่สั้นเกินไป หรือยาวเกินไป
-                if 3 <= len(name) <= 100:
+                if 3 <= len(name) <= 100 and not name.replace(' ', '').startswith('ธนาคาร'):
                     return name
-        
+
+        # ── Krungthai bill payment: ชื่อร้าน/merchant อยู่บรรทัดเดียว ────────
+        lines = text_clean.split('\n')
+        found_sender = False
+        for line in lines:
+            line = line.strip()
+            if len(line) < 3:
+                continue
+            if re.search(r'(?:นาย|นาง|นางสาว)', line):
+                found_sender = True
+                continue
+            if re.search(r'(?:กรุงไทย|กสิกร|ไทยพาณิชย์|XXX|xxx|\d{3}-\d|รหัส|เลข|จำนวน|ค่าธรรมเนียม|วันที่|บาท|จ่ายบิลสำเร็จ|โอนเงิน|สำเร็จ|Krungthai)', line, re.IGNORECASE):
+                continue
+            if found_sender:
+                if re.match(r'^[A-Za-z\u0E00-\u0E7F][A-Za-z\u0E00-\u0E7F\s_\-\.\&]{2,50}$', line) and not line.replace(' ', '').startswith('ธนาคาร'):
+                    return ' '.join(line.split())
+
+        # ── Krungsri: ชื่ออยู่หน้าคำว่า สำหรับ/for และมีบัญชีแบบ XXX- ────────
+        for i, line in enumerate(lines):
+            line = line.strip()
+            # 123 สำหรับ แกร็บ -> แกร็บ
+            m1 = re.search(r'(?:สำหรับ|for)\s+([A-Za-z\u0E00-\u0E7F\s]+)', line)
+            if m1 and i + 1 < len(lines) and re.search(r'x', lines[i+1], re.IGNORECASE):
+                name = m1.group(1).strip()
+                if len(name) > 2 and not name.replace(' ', '').startswith('ธนาคาร'):
+                    return name
+
         return None
 
     def _extract_sender_account(self, text: str) -> str | None:
@@ -399,15 +466,40 @@ class SlipParser:
 
     def _extract_receiver_account(self, text: str) -> str | None:
 
-        # ลองหา merchant ID ก่อน (ตัวเลขยาวที่ไม่ใช่ ref no.)
-        merchant_match = self.MERCHANT_ID_REGEX.search(text)
-        if merchant_match:
+        # 1. ลองหาบัญชีธนาคารรูปแบบปกติที่มีขีดคั่นก่อน เพราะแม่นยำที่สุด
+        match = self.BANK_ACCOUNT_REGEX.search(text)
+        if match:
+            # สำหรับ GSB บางที OCR อ่านข้ามขีดเป็น x
+            # 14xxxx0073 หรือ 14-x-xxxxx-3
+            return match.group(1)
+
+        # 2. ถ้าไม่เจอรูปแบบขีด ลองหา Merchant ID (ตัวเลขล้วน 12-20 หลัก)
+        merchant_matches = self.MERCHANT_ID_REGEX.finditer(text)
+        for merchant_match in merchant_matches:
             merchant_id = merchant_match.group(1)
-            # ตรวจสอบว่าไม่ใช่เลขที่รายการ
+            # ตรวจสอบว่า merchant_id นี้ ไม่ได้เป็นส่วนหนึ่งของรหัสอ้างอิง MyMo (24 หลัก)
+            # GSB ref: 606917232661... (12 digits front)
             if merchant_id and len(merchant_id) >= 12:
+                # ป้องกันไม่ให้หยิบ MyMo Reference number ครึ่งหน้ามาเป็นเลขบัญชี
+                # (ถ้ามันต่อด้วย I000... แสดงว่าเป็น ref no แน่ๆ)
+                full_text_after = text[merchant_match.start():merchant_match.start() + 25]
+                if re.match(r'^\d{12}[1liI\|0]\d', full_text_after, re.IGNORECASE):
+                    continue # นี่คือ Ref No, ปล่อยผ่าน
                 return merchant_id
+
+        # 3. ลองหาข้อมูลในรูปแบบที่ OCR ตกหล่นเครื่องหมายขีด (เช่น xxxx) 
+        # KBank/GSB มักมี pattern: 14xxxx0073, 0203xxxx4999
+        masked_acc_match = re.search(r'\b(\d{2,4}[xX]{3,6}\d{2,4})\b', text)
+        if masked_acc_match:
+            return masked_acc_match.group(1)
+
+        # 4. หาตัวเลข 10 หลักที่ตามหลังคำว่า เลขบัญชีรับ/บัญชีผู้รับ
+        # เผื่อกรณีที่มันขึ้นต้นแบบไม่มีขีดเลย เช่น "เลขบัญชีรับ\n6069172326"
+        account_keyword_match = re.search(r'(?:เลขบัญชีรับ|บัญชีผู้รับ|บัญชีรับ|account|acc)[*:\s\n]+(\d{10})', text, re.IGNORECASE)
+        if account_keyword_match:
+            return account_keyword_match.group(1)
         
-        # ถ้าไม่เจอ merchant ID ให้หาบัญชีปกติ (แต่ไม่ใช่ของ sender)
+        # 5. ถ้าไม่เจอ merchant ID ให้หาบัญชีปกติ (แต่ไม่ใช่ของ sender)
         # สำหรับกรณีโอนให้บุคคลทั่วไป
         matches = self.BANK_ACCOUNT_REGEX.findall(text)
         if len(matches) > 1:
